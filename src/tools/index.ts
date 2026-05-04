@@ -9,6 +9,7 @@ import { z } from 'zod';
 import type { PremiereProTransport } from '../bridge/types.js';
 import { Logger } from '../utils/logger.js';
 import { createMotionDemoAssets } from '../utils/demoAssets.js';
+import { PerceptionTools } from './perception/index.js';
 
 export interface MCPTool {
   name: string;
@@ -122,14 +123,17 @@ const clipPlanSchema = z.object({
 export class PremiereProTools {
   private bridge: PremiereProTransport;
   private logger: Logger;
+  private perception: PerceptionTools;
 
   constructor(bridge: PremiereProTransport) {
     this.bridge = bridge;
     this.logger = new Logger('PremiereProTools');
+    this.perception = new PerceptionTools();
   }
 
   getAvailableTools(): MCPTool[] {
     return [
+      ...this.perception.getAvailableTools(),
       // Discovery Tools (NEW)
       {
         name: 'list_project_items',
@@ -1070,7 +1074,18 @@ export class PremiereProTools {
     }
 
     this.logger.info(`Executing tool: ${name} with args:`, args);
-    
+
+    // Perception tools (transcription, take selection) — local, no Premiere bridge needed.
+    if (PerceptionTools.TOOL_NAMES.has(name)) {
+      try {
+        return await this.perception.executeTool(name, args);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.logger.error(`Perception tool '${name}' threw: ${message}`);
+        return { success: false, error: message };
+      }
+    }
+
     try {
       switch (name) {
         // Discovery Tools
