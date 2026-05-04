@@ -17,13 +17,15 @@
 
 import { z } from 'zod';
 import type { MCPTool } from '../index.js';
+import type { PremiereProTransport } from '../../bridge/types.js';
 import { Logger } from '../../utils/logger.js';
 import { transcribeWithWhisper, getDefaultModelPath } from './whisper.js';
-import { TranscriptSchema } from './types.js';
+import { TranscriptSchema, CutEntrySchema, type CutEntry } from './types.js';
 import { findFillerWords } from './filler.js';
 import { detectSilences } from './silence.js';
 import { findFalseStarts } from './falseStart.js';
 import { scoreTakes, type ScoreTakesOptions } from './takes.js';
+import { buildApplyCutListScript } from './cutlist.js';
 
 // ---------- Schemas ----------
 
@@ -163,10 +165,44 @@ const SCORE_TAKES_SCHEMA = z.object({
     .describe('Override scoring weights. Defaults are tuned for talking-head video.'),
 });
 
+const APPLY_CUT_LIST_SCHEMA = z.object({
+  sequenceId: z
+    .string()
+    .optional()
+    .describe('Sequence ID to apply cuts to. Omit to use the active sequence.'),
+  cuts: z
+    .array(CutEntrySchema)
+    .min(1)
+    .describe(
+      'Cut entries. Only entries with action="remove" are executed; "keep" entries are passed through for symmetry. Time ranges are in seconds from the start of the sequence.'
+    ),
+  videoTrackIndices: z
+    .array(z.number().int().min(0))
+    .optional()
+    .describe('Specific video track indices to affect. Omit for all video tracks.'),
+  audioTrackIndices: z
+    .array(z.number().int().min(0))
+    .optional()
+    .describe('Specific audio track indices to affect. Omit for all audio tracks.'),
+  rippleDelete: z
+    .boolean()
+    .optional()
+    .describe(
+      'Close the gap after each cut so subsequent clips slide left. Default true. Set false to "lift" instead (leave the gap).'
+    ),
+  dryRun: z
+    .boolean()
+    .optional()
+    .describe(
+      'When true, runs the razor + clip-discovery logic but skips the actual remove call. Returns the same shape so you can preview which clips would be affected. Default false.'
+    ),
+});
+
 // ---------- PerceptionTools class ----------
 
 export class PerceptionTools {
   private logger = new Logger('PerceptionTools');
+  private bridge: PremiereProTransport | undefined;
 
   /** Tool names handled by this module — main dispatcher checks against this set. */
   static readonly TOOL_NAMES: ReadonlySet<string> = new Set([
@@ -175,7 +211,12 @@ export class PerceptionTools {
     'detect_silences',
     'find_false_starts',
     'score_takes',
+    'apply_cut_list',
   ]);
+
+  constructor(bridge?: PremiereProTransport) {
+    this.bridge = bridge;
+  }
 
   getAvailableTools(): MCPTool[] {
     return [
@@ -229,6 +270,19 @@ export class PerceptionTools {
           'scoring take.',
         inputSchema: SCORE_TAKES_SCHEMA,
       },
+      {
+        name: 'apply_cut_list',
+        description:
+          'Executes a cut list on the Premiere timeline. For each entry with ' +
+          'action="remove", razors at the entry\'s start and end on the selected ' +
+          'tracks (or all tracks by default) and ripple-deletes the resulting clip. ' +
+          'Cuts are applied in reverse chronological order so earlier timestamps ' +
+          'remain valid throughout. Set dryRun=true for a preview that reports ' +
+          'which clips would be affected without modifying the timeline. This is ' +
+          'the executor used after Claude proposes cuts derived from find_filler_words, ' +
+          'find_false_starts, detect_silences, and your review.',
+        inputSchema: APPLY_CUT_LIST_SCHEMA,
+      },
     ];
   }
 
@@ -244,6 +298,8 @@ export class PerceptionTools {
         return this.findFalseStarts(args as z.infer<typeof FIND_FALSE_STARTS_SCHEMA>);
       case 'score_takes':
         return this.scoreTakes(args as z.infer<typeof SCORE_TAKES_SCHEMA>);
+      case 'apply_cut_list':
+        return this.applyCutList(args as z.infer<typeof APPLY_CUT_LIST_SCHEMA>);
       default:
         return {
           success: false,
@@ -373,6 +429,69 @@ export class PerceptionTools {
       return { success: true, ...result };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      return { success: false, error: message };
+    }
+  }
+
+  private async applyCutList(
+    args: z.infer<typeof APPLY_CUT_LIST_SCHEMA>
+  ): Promise<any> {
+    if (!this.bridge) {
+      return {
+        success: false,
+        error:
+          'apply_cut_list requires the Premiere bridge but PerceptionTools was constructed without one.',
+      };
+    }
+
+    // Build the input the script builder expects, only setting fields we
+    // actually have so we don't carry undefineds through exactOptionalPropertyTypes.
+    const cuts: CutEntry[] = args.cuts.map((c) => {
+      const entry: CutEntry = {
+        startSec: c.startSec,
+        endSec: c.endSec,
+        action: c.action,
+      };
+      if (c.reason !== undefined) entry.reason = c.reason;
+      if (c.source !== undefined) entry.source = c.source;
+      return entry;
+    });
+
+    const removeCount = cuts.filter((c) => c.action === 'remove').length;
+    if (removeCount === 0) {
+      return {
+        success: true,
+        message: 'No remove-action cuts provided — nothing to apply.',
+        applied: [],
+        skipped: [],
+        errors: [],
+        summary: {
+          requested: cuts.length,
+          appliedCount: 0,
+          skippedCount: 0,
+          errorCount: 0,
+          totalSecondsCut: 0,
+        },
+      };
+    }
+
+    const scriptInput: Parameters<typeof buildApplyCutListScript>[0] = { cuts };
+    if (args.sequenceId !== undefined) scriptInput.sequenceId = args.sequenceId;
+    if (args.videoTrackIndices !== undefined) scriptInput.videoTrackIndices = args.videoTrackIndices;
+    if (args.audioTrackIndices !== undefined) scriptInput.audioTrackIndices = args.audioTrackIndices;
+    if (args.rippleDelete !== undefined) scriptInput.rippleDelete = args.rippleDelete;
+    if (args.dryRun !== undefined) scriptInput.dryRun = args.dryRun;
+
+    const script = buildApplyCutListScript(scriptInput);
+    this.logger.info(
+      `apply_cut_list: ${removeCount} remove-action cuts, dryRun=${args.dryRun ?? false}, ripple=${args.rippleDelete ?? true}`
+    );
+
+    try {
+      return await this.bridge.executeScript(script);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.error(`apply_cut_list bridge error: ${message}`);
       return { success: false, error: message };
     }
   }

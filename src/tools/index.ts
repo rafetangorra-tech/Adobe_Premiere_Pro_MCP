@@ -128,7 +128,7 @@ export class PremiereProTools {
   constructor(bridge: PremiereProTransport) {
     this.bridge = bridge;
     this.logger = new Logger('PremiereProTools');
-    this.perception = new PerceptionTools();
+    this.perception = new PerceptionTools(bridge);
   }
 
   getAvailableTools(): MCPTool[] {
